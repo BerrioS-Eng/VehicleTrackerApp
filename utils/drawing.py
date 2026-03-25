@@ -1,16 +1,14 @@
 """
 drawing.py
 Responsabilidad: funciones auxiliares para dibujar
-contornos, bounding boxes, centroides y etiquetas sobre frames.
+contornos, centroides y etiquetas sobre frames.
 """
 
 import cv2
 
-
-# ── Colores BGR por defecto ────────────────────────────────
+# ── Colores BGR ────────────────────────────────────────────
 COLOR_CONTOUR = (0, 255, 0)      # Verde
-COLOR_BBOX = (255, 0, 0)         # Azul
-COLOR_CENTROID = (0, 0, 255)     # Rojo
+COLOR_CENTROID = (255, 100, 0)   # Azul
 COLOR_TEXT = (255, 255, 255)     # Blanco
 
 
@@ -20,39 +18,32 @@ def draw_contours(frame, contours, color=COLOR_CONTOUR, thickness=2):
     return frame
 
 
-def draw_bounding_boxes(frame, bboxes, color=COLOR_BBOX, thickness=2):
-    """Dibuja los bounding boxes (x, y, w, h) sobre el frame."""
-    for (x, y, w, h) in bboxes:
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-    return frame
-
-
-def draw_centroids(frame, centroids, color=COLOR_CENTROID, radius=5):
+def draw_centroids(frame, centroids, color=COLOR_CENTROID, radius=6):
     """Dibuja los centroides como círculos sobre el frame."""
     for (cx, cy) in centroids:
         cv2.circle(frame, (cx, cy), radius, color, -1)
+        # Borde blanco para mejor visibilidad
+        cv2.circle(frame, (cx, cy), radius, (255, 255, 255), 1)
     return frame
 
 
-def draw_labels(frame, bboxes, prefix="V", color=COLOR_TEXT):
-    """Dibuja etiquetas con ID sobre cada bounding box."""
-    for i, (x, y, w, h) in enumerate(bboxes):
+def draw_labels(frame, centroids, prefix="V", color=COLOR_TEXT):
+    """Dibuja etiquetas con ID junto a cada centroide."""
+    for i, (cx, cy) in enumerate(centroids):
         label = f"{prefix}{i + 1}"
         cv2.putText(
-            frame, label, (x, y - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+            frame, label, (cx + 10, cy - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
         )
     return frame
 
 
 def draw_detections(frame, detections):
     """
-    Dibuja toda la información de detección sobre el frame.
+    Dibuja contornos + centroides + etiquetas sobre el frame.
     detections: dict retornado por Detector.detect().
-    Retorna el frame anotado (modifica el original).
     """
     draw_contours(frame, detections["contours"])
-    draw_bounding_boxes(frame, detections["bounding_boxes"])
     draw_centroids(frame, detections["centroids"])
-    draw_labels(frame, detections["bounding_boxes"])
+    draw_labels(frame, detections["centroids"])
     return frame
