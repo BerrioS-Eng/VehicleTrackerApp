@@ -2,7 +2,7 @@
 analyzer.py
 Responsabilidad: análisis cinemático del vehículo rastreado.
 Posición, velocidad y aceleración mediante diferencias finitas.
-Suavizado de datos para reducir ruido en las derivadas.
+Suavizado de datos y conversión de escala px ↔ metros.
 """
 
 import math
@@ -13,8 +13,57 @@ class Analyzer:
 
     def __init__(self, fps=30, smooth_window=5):
         self.fps = fps
-        self.smooth_window = smooth_window  # Ventana de media móvil
+        self.smooth_window = smooth_window
         self._positions = []
+
+        # Escala: puntos A y B de referencia
+        self._point_a = None  # (x, y) en px
+        self._point_b = None  # (x, y) en px
+        self._real_distance_m = None
+        self._px_per_meter = None
+
+    # ── Escala ─────────────────────────────────────────────
+
+    def set_scale(self, point_a, point_b, real_distance_m):
+        """
+        Calibra la escala con dos puntos y su distancia real.
+        point_a, point_b: (x, y) en píxeles.
+        real_distance_m: distancia real en metros.
+        """
+        self._point_a = point_a
+        self._point_b = point_b
+        self._real_distance_m = real_distance_m
+
+        dx = point_b[0] - point_a[0]
+        dy = point_b[1] - point_a[1]
+        px_dist = math.sqrt(dx ** 2 + dy ** 2)
+
+        if real_distance_m > 0:
+            self._px_per_meter = px_dist / real_distance_m
+
+    def has_scale(self) -> bool:
+        return self._px_per_meter is not None
+
+    def get_scale_points(self):
+        """Retorna (point_a, point_b) o (None, None)."""
+        return self._point_a, self._point_b
+
+    def get_real_distance(self):
+        return self._real_distance_m
+
+    def get_px_per_meter(self):
+        return self._px_per_meter
+
+    def px_to_meters(self, px_value):
+        if self._px_per_meter is None or self._px_per_meter == 0:
+            return None
+        return px_value / self._px_per_meter
+
+    def clear_scale(self):
+        self._point_a = None
+        self._point_b = None
+        self._real_distance_m = None
+        self._px_per_meter = None
 
     # ── Registro de posiciones ─────────────────────────────
 
@@ -44,10 +93,6 @@ class Analyzer:
     # ── Suavizado ──────────────────────────────────────────
 
     def _smooth(self, data):
-        """
-        Media móvil centrada para suavizar datos.
-        Reduce el ruido de detección antes de calcular derivadas.
-        """
         n = len(data)
         if n < self.smooth_window:
             return data[:]
@@ -69,25 +114,21 @@ class Analyzer:
         return [p["time"] for p in self._positions]
 
     def get_positions_px(self):
-        """Retorna posiciones crudas (sin suavizar)."""
         cx = [p["cx"] for p in self._positions]
         cy = [p["cy"] for p in self._positions]
         return cx, cy
 
     def get_positions_smooth(self):
-        """Retorna posiciones suavizadas."""
         cx, cy = self.get_positions_px()
         return self._smooth(cx), self._smooth(cy)
 
-    # ── Velocidad (diferencias finitas hacia adelante) ─────
+    def get_trajectory(self):
+        """Retorna lista de (cx, cy) para dibujar la trayectoria."""
+        return [(p["cx"], p["cy"]) for p in self._positions]
+
+    # ── Velocidad ──────────────────────────────────────────
 
     def get_velocity(self):
-        """
-        Velocidad instantánea sobre posiciones suavizadas:
-          vx[i] = (x[i+1] - x[i]) / dt
-
-        Retorna (t, vx, vy, vmag).
-        """
         n = len(self._positions)
         if n < 2:
             return [], [], [], []
@@ -119,18 +160,18 @@ class Analyzer:
             vy.append(vy_i)
             vmag.append(vm_i)
 
-        # Suavizar también la velocidad resultante
         return t, self._smooth(vx), self._smooth(vy), self._smooth(vmag)
 
-    # ── Aceleración (segunda derivada numérica) ────────────
+    def get_current_velocity(self):
+        """Retorna la velocidad instantánea actual (último frame)."""
+        _, vx, vy, vmag = self.get_velocity()
+        if not vmag:
+            return 0, 0, 0
+        return vx[-1], vy[-1], vmag[-1]
+
+    # ── Aceleración ────────────────────────────────────────
 
     def get_acceleration(self):
-        """
-        Aceleración como derivada de la velocidad suavizada:
-          ax[i] = (vx[i+1] - vx[i]) / dt
-
-        Retorna (t, ax, ay, amag).
-        """
         t_v, vx, vy, _ = self.get_velocity()
         n = len(vx)
         if n < 2:
@@ -160,5 +201,11 @@ class Analyzer:
             ay.append(ay_i)
             amag.append(am_i)
 
-        # Suavizar la aceleración también
         return t, self._smooth(ax), self._smooth(ay), self._smooth(amag)
+
+    def get_current_acceleration(self):
+        """Retorna la aceleración instantánea actual."""
+        _, ax, ay, amag = self.get_acceleration()
+        if not amag:
+            return 0, 0, 0
+        return ax[-1], ay[-1], amag[-1]

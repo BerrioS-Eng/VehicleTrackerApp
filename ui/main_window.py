@@ -1,11 +1,13 @@
 """
 main_window.py
 Responsabilidad: construir y gestionar la ventana principal.
-Layout 2x2 con análisis cinemático y gráficas navegables.
+Layout 2x2 con trayectoria, velocidad en tiempo real,
+marcadores de escala y gráficas navegables.
 """
 
+import math
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 
 import cv2
 from PIL import Image, ImageTk
@@ -15,7 +17,10 @@ from core.video_handler import VideoHandler
 from core.preprocessor import Preprocessor
 from core.detector import Detector
 from core.analyzer import Analyzer
-from utils.drawing import draw_detections
+from utils.drawing import (
+    draw_detections, draw_trajectory, draw_velocity_info,
+    draw_scale_markers,
+)
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -67,8 +72,15 @@ class MainWindow:
         self._roi_points_canvas = []
         self._roi_temp_ids = []
 
+        # Calibración de escala (A y B)
+        self._calibrating = False
+        self._cal_points_canvas = []
+        self._cal_temp_ids = []
+        # Frames de calentamiento para el sustractor de fondo
+        self._warmup_frames = 0
+
         # Gráfica activa
-        self._current_graph = 0  # índice en GRAPH_MODES
+        self._current_graph = 0
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -107,7 +119,7 @@ class MainWindow:
         self.lbl_detections = tk.Label(toolbar, text="")
         self.lbl_detections.pack(side=tk.RIGHT, padx=10)
 
-        # --- Barra herramientas: ROI y Color ---
+        # --- Barra herramientas: ROI, Color, Escala ---
         toolbar2 = tk.Frame(self.root)
         toolbar2.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
 
@@ -137,6 +149,25 @@ class MainWindow:
             state=tk.DISABLED,
         )
         self.chk_color.pack(side=tk.LEFT, padx=3)
+
+        tk.Label(toolbar2, text="│").pack(side=tk.LEFT, padx=5)
+
+        self.btn_scale = tk.Button(
+            toolbar2, text="Escala A↔B",
+            command=self._start_calibration, state=tk.DISABLED
+        )
+        self.btn_scale.pack(side=tk.LEFT, padx=3)
+
+        self.btn_scale_clear = tk.Button(
+            toolbar2, text="Limpiar Escala",
+            command=self._clear_scale, state=tk.DISABLED
+        )
+        self.btn_scale_clear.pack(side=tk.LEFT, padx=3)
+
+        self.lbl_scale_status = tk.Label(
+            toolbar2, text="Escala: No calibrada", fg="gray"
+        )
+        self.lbl_scale_status.pack(side=tk.LEFT, padx=10)
 
         # --- Grilla 2x2 ---
         self.grid_frame = tk.Frame(self.root)
@@ -241,13 +272,11 @@ class MainWindow:
         return panel
 
     def _build_graph_panel(self, parent, row, col):
-        """Panel de gráficas con botones de navegación."""
         frame = tk.Frame(parent, bd=1, relief=tk.SUNKEN)
         frame.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        # Header con botones de navegación
         header = tk.Frame(frame)
         header.grid(row=0, column=0, sticky="ew")
 
@@ -269,6 +298,12 @@ class MainWindow:
         )
         self.btn_graph_next.pack(side=tk.LEFT, padx=3, pady=2)
 
+        # Valores numéricos actuales
+        self.lbl_graph_values = tk.Label(
+            header, text="", font=("Consolas", 8), fg="#00ccff"
+        )
+        self.lbl_graph_values.pack(side=tk.RIGHT, padx=10)
+
         # Matplotlib
         self._fig = Figure(figsize=(4, 3), dpi=80)
         self._fig.set_facecolor("#1e1e1e")
@@ -283,7 +318,6 @@ class MainWindow:
         self._graph_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _style_axes(self):
-        """Aplica estilo oscuro a los ejes."""
         for ax in (self._ax1, self._ax2):
             ax.set_facecolor("#2b2b2b")
             ax.tick_params(colors="white", labelsize=7)
@@ -333,6 +367,7 @@ class MainWindow:
             self.preprocessor.clear_roi()
             self.analyzer.fps = info["fps"]
             self.analyzer.clear_positions()
+            self._warmup_frames = 0
             self.lbl_roi_status.config(text="ROI: No definida", fg="gray")
             self._enable_selectors()
             self._show_first_frame()
@@ -350,6 +385,8 @@ class MainWindow:
         self.btn_roi.config(state=tk.NORMAL)
         self.btn_roi_clear.config(state=tk.NORMAL)
         self.chk_color.config(state=tk.NORMAL)
+        self.btn_scale.config(state=tk.NORMAL)
+        self.btn_scale_clear.config(state=tk.NORMAL)
         self.btn_graph_prev.config(state=tk.NORMAL)
         self.btn_graph_next.config(state=tk.NORMAL)
 
@@ -486,6 +523,125 @@ class MainWindow:
         self.lbl_roi_status.config(text="ROI: No definida", fg="gray")
         self._refresh_panels()
 
+    # ── Calibración de escala A↔B ──────────────────────────
+
+    def _start_calibration(self):
+        if self._last_frame is None:
+            return
+        self._pause()
+        self._calibrating = True
+        self._cal_points_canvas = []
+        self._cal_temp_ids = []
+        self.btn_scale.config(
+            text="Cancelar", command=self._cancel_calibration
+        )
+        self.lbl_scale_status.config(
+            text="Escala: Marca punto A...", fg="orange"
+        )
+        canvas = self.panel_original["canvas"]
+        canvas.bind("<Button-1>", self._on_cal_click)
+
+    def _on_cal_click(self, event):
+        if not self._calibrating:
+            return
+
+        canvas = self.panel_original["canvas"]
+        r = 6
+
+        if len(self._cal_points_canvas) == 0:
+            # Punto A
+            pid = canvas.create_oval(
+                event.x - r, event.y - r, event.x + r, event.y + r,
+                fill="green", outline="white", width=2
+            )
+            tid = canvas.create_text(
+                event.x + 15, event.y - 10, text="A",
+                fill="green", font=("Helvetica", 12, "bold")
+            )
+            self._cal_temp_ids.extend([pid, tid])
+            self._cal_points_canvas.append((event.x, event.y))
+            self.lbl_scale_status.config(
+                text="Escala: Marca punto B...", fg="orange"
+            )
+
+        elif len(self._cal_points_canvas) == 1:
+            # Punto B
+            pid = canvas.create_oval(
+                event.x - r, event.y - r, event.x + r, event.y + r,
+                fill="red", outline="white", width=2
+            )
+            tid = canvas.create_text(
+                event.x + 15, event.y - 10, text="B",
+                fill="red", font=("Helvetica", 12, "bold")
+            )
+            # Línea A→B
+            p1 = self._cal_points_canvas[0]
+            lid = canvas.create_line(
+                p1[0], p1[1], event.x, event.y,
+                fill="cyan", width=2, dash=(4, 2)
+            )
+            self._cal_temp_ids.extend([pid, tid, lid])
+            self._cal_points_canvas.append((event.x, event.y))
+            canvas.unbind("<Button-1>")
+            self._finish_calibration()
+
+    def _finish_calibration(self):
+        frame_points = self._canvas_to_frame_coords(
+            self._cal_points_canvas, self.panel_original["canvas"]
+        )
+        p1, p2 = frame_points
+        px_dist = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
+
+        real_dist = simpledialog.askfloat(
+            "Calibrar Escala",
+            f"Distancia A↔B en píxeles: {px_dist:.1f}\n\n"
+            "Ingresa la distancia real en metros:",
+            minvalue=0.01, parent=self.root
+        )
+
+        # Limpiar temporales
+        canvas = self.panel_original["canvas"]
+        for item_id in self._cal_temp_ids:
+            canvas.delete(item_id)
+        self._cal_temp_ids = []
+        self._calibrating = False
+        self.btn_scale.config(
+            text="Escala A↔B", command=self._start_calibration
+        )
+
+        if real_dist is not None and real_dist > 0:
+            self.analyzer.set_scale(
+                tuple(frame_points[0]),
+                tuple(frame_points[1]),
+                real_dist
+            )
+            px_m = self.analyzer.get_px_per_meter()
+            self.lbl_scale_status.config(
+                text=f"Escala: {px_m:.1f} px/m  ({real_dist:.1f}m)",
+                fg="green"
+            )
+        else:
+            self.lbl_scale_status.config(text="Escala: Cancelada", fg="gray")
+
+        self._refresh_panels()
+
+    def _cancel_calibration(self):
+        canvas = self.panel_original["canvas"]
+        canvas.unbind("<Button-1>")
+        for item_id in self._cal_temp_ids:
+            canvas.delete(item_id)
+        self._cal_temp_ids = []
+        self._calibrating = False
+        self.btn_scale.config(
+            text="Escala A↔B", command=self._start_calibration
+        )
+        self.lbl_scale_status.config(text="Escala: No calibrada", fg="gray")
+
+    def _clear_scale(self):
+        self.analyzer.clear_scale()
+        self.lbl_scale_status.config(text="Escala: No calibrada", fg="gray")
+        self._refresh_panels()
+
     # ── Utilidades de coordenadas ──────────────────────────
 
     def _canvas_to_frame_coords(self, canvas_points, canvas):
@@ -515,7 +671,11 @@ class MainWindow:
         mask = self.preprocessor.apply_full_pipeline(frame)
         self._last_detections = self.detector.detect(mask)
 
-        # Registrar centroide del contorno más grande
+        # Ignorar los primeros 15 frames (calentamiento del BG subtractor)
+        self._warmup_frames += 1
+        if self._warmup_frames <= 15:
+            return self._last_detections
+
         if self._last_detections["centroids"]:
             contours = self._last_detections["contours"]
             largest_idx = max(
@@ -534,8 +694,7 @@ class MainWindow:
     def _apply_color_mode(self, frame, mode):
         pp = self.preprocessor
         if mode == "HSV":
-            result = pp.to_hsv(frame)
-            return cv2.cvtColor(result, cv2.COLOR_HSV2RGB)
+            return pp.to_hsv(frame)
         elif mode == "Máscara HSV":
             result = pp.hsv_mask(frame)
             return cv2.cvtColor(result, cv2.COLOR_GRAY2RGB)
@@ -567,11 +726,12 @@ class MainWindow:
     # ── Gráficas ───────────────────────────────────────────
 
     def _update_graphs(self):
-        """Actualiza la gráfica según el modo seleccionado."""
         self._ax1.clear()
         self._ax2.clear()
 
         mode = self.GRAPH_MODES[self._current_graph]
+        has_scale = self.analyzer.has_scale()
+        px_m = self.analyzer.get_px_per_meter() if has_scale else None
 
         if self.analyzer.get_position_count() < 2:
             for ax in (self._ax1, self._ax2):
@@ -581,6 +741,7 @@ class MainWindow:
                     color="gray", ha="center", va="center",
                     transform=ax.transAxes, fontsize=9
                 )
+            self.lbl_graph_values.config(text="")
             self._style_axes()
             self._fig.tight_layout(pad=1.5)
             self._fig.canvas.draw_idle()
@@ -588,35 +749,73 @@ class MainWindow:
 
         if mode == "Posición":
             t = self.analyzer.get_time_array()
-            cx, cy = self.analyzer.get_positions_px()
+            cx, cy = self.analyzer.get_positions_smooth()
+
+            unit = "px"
+            if has_scale:
+                cx = [v / px_m for v in cx]
+                cy = [v / px_m for v in cy]
+                unit = "m"
+
             self._ax1.plot(t, cx, color="#00ccff", linewidth=1.2)
             self._ax1.set_title("X(t)", fontsize=9)
-            self._ax1.set_ylabel("X (px)", fontsize=8)
+            self._ax1.set_ylabel(f"X ({unit})", fontsize=8)
+
             self._ax2.plot(t, cy, color="#ff6600", linewidth=1.2)
             self._ax2.set_title("Y(t)", fontsize=9)
-            self._ax2.set_ylabel("Y (px)", fontsize=8)
+            self._ax2.set_ylabel(f"Y ({unit})", fontsize=8)
+
+            self.lbl_graph_values.config(
+                text=f"X={cx[-1]:.1f} {unit}  Y={cy[-1]:.1f} {unit}"
+            )
 
         elif mode == "Velocidad":
             t, vx, vy, vmag = self.analyzer.get_velocity()
+
+            unit = "px/s"
+            if has_scale:
+                vx = [v / px_m for v in vx]
+                vy = [v / px_m for v in vy]
+                vmag = [v / px_m for v in vmag]
+                unit = "m/s"
+
             self._ax1.plot(t, vx, color="#00ccff", linewidth=1, label="Vx")
             self._ax1.plot(t, vy, color="#ff6600", linewidth=1, label="Vy")
             self._ax1.legend(fontsize=7, facecolor="#2b2b2b", labelcolor="white")
             self._ax1.set_title("Vx(t), Vy(t)", fontsize=9)
-            self._ax1.set_ylabel("V (px/s)", fontsize=8)
+            self._ax1.set_ylabel(f"V ({unit})", fontsize=8)
+
             self._ax2.plot(t, vmag, color="#00ff88", linewidth=1.2)
             self._ax2.set_title("|V|(t)", fontsize=9)
-            self._ax2.set_ylabel("|V| (px/s)", fontsize=8)
+            self._ax2.set_ylabel(f"|V| ({unit})", fontsize=8)
+
+            self.lbl_graph_values.config(
+                text=f"Vx={vx[-1]:.1f}  Vy={vy[-1]:.1f}  |V|={vmag[-1]:.1f} {unit}"
+            )
 
         elif mode == "Aceleración":
             t, ax_d, ay_d, amag = self.analyzer.get_acceleration()
+
+            unit = "px/s²"
+            if has_scale:
+                ax_d = [v / px_m for v in ax_d]
+                ay_d = [v / px_m for v in ay_d]
+                amag = [v / px_m for v in amag]
+                unit = "m/s²"
+
             self._ax1.plot(t, ax_d, color="#00ccff", linewidth=1, label="Ax")
             self._ax1.plot(t, ay_d, color="#ff6600", linewidth=1, label="Ay")
             self._ax1.legend(fontsize=7, facecolor="#2b2b2b", labelcolor="white")
             self._ax1.set_title("Ax(t), Ay(t)", fontsize=9)
-            self._ax1.set_ylabel("A (px/s²)", fontsize=8)
+            self._ax1.set_ylabel(f"A ({unit})", fontsize=8)
+
             self._ax2.plot(t, amag, color="#ff4444", linewidth=1.2)
             self._ax2.set_title("|A|(t)", fontsize=9)
-            self._ax2.set_ylabel("|A| (px/s²)", fontsize=8)
+            self._ax2.set_ylabel(f"|A| ({unit})", fontsize=8)
+
+            self.lbl_graph_values.config(
+                text=f"Ax={ax_d[-1]:.1f}  Ay={ay_d[-1]:.1f}  |A|={amag[-1]:.1f} {unit}"
+            )
 
         self._ax2.set_xlabel("Tiempo (s)", fontsize=8)
         self._style_axes()
@@ -630,18 +829,46 @@ class MainWindow:
         n = len(self._last_detections["contours"])
         self.lbl_detections.config(text=f"Detectados: {n}")
 
-        # Posición actual en barra inferior
+        # Info en barra inferior
         last_pos = self.analyzer.get_last_position()
         if last_pos:
-            self.lbl_position.config(
-                text=f"Centroide: ({last_pos['cx']}, {last_pos['cy']}) px"
-            )
+            txt = f"Centroide: ({last_pos['cx']}, {last_pos['cy']}) px"
+            if self.analyzer.has_scale():
+                px_m = self.analyzer.get_px_per_meter()
+                vx, vy, vm = self.analyzer.get_current_velocity()
+                vm_ms = vm / px_m
+                txt += f"  |  V={vm_ms:.2f} m/s"
+            self.lbl_position.config(text=txt)
 
-        # Sup-Izq: Original + ROI + detección
+        # Sup-Izq: Original + ROI + trayectoria + detección + velocidad + escala
         annotated = frame.copy()
         annotated = self.preprocessor.get_roi_overlay(annotated)
+
+        # Marcadores de escala A↔B
+        pa, pb = self.analyzer.get_scale_points()
+        if pa and pb:
+            draw_scale_markers(
+                annotated, pa, pb, self.analyzer.get_real_distance()
+            )
+
+        # Trayectoria
+        trajectory = self.analyzer.get_trajectory()
+        draw_trajectory(annotated, trajectory)
+
+        # Detección (contornos + centroide)
         if self._last_detections:
             draw_detections(annotated, self._last_detections)
+
+        # Velocidad sobre el centroide
+        if last_pos:
+            _, _, vm = self.analyzer.get_current_velocity()
+            draw_velocity_info(
+                annotated, vm,
+                (last_pos["cx"], last_pos["cy"]),
+                has_scale=self.analyzer.has_scale(),
+                px_per_meter=self.analyzer.get_px_per_meter(),
+            )
+
         original_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         self._draw_on_canvas(
             self.panel_original["canvas"], original_rgb, "original"
